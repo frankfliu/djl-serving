@@ -1,0 +1,13 @@
+@startuml
+'https://plantuml.com/sequence-diagram
+
+autonumber
+
+"SageMaker Notebook" -> Rubik: start training
+Rubik -> Rubik: Save checkpoints
+Rubik -> Rubik: partition model
+Rubik -> S3: Save partition files
+"SageMaker Notebook" -> FSx: create FSx
+"SageMaker Notebook" -> S3: Save .tar.gz with partition metadata
+"SageMaker Notebook" -> SageMaker: create_model
+@enduml

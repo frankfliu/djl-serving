@@ -1,0 +1,17 @@
+@startuml
+'https://plantuml.com/sequence-diagram
+
+autonumber
+
+User -> SageMaker: aws sagemaker create-model ...
+SageMaker -> PartitionService: partition('P3.16xl')
+PartitionService -> S3: read model file
+S3 --> PartitionService:  .tar.gz file
+PartitionService -> PartitionService: split model
+PartitionService -> S3: save partition files
+PartitionService -> FSx: create FSx
+PartitionService --> SageMaker: partition metadata
+SageMaker -> DynamoDB: save partition metadata
+SageMaker --> User: model information
+
+@enduml

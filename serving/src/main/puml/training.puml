@@ -1,0 +1,15 @@
+@startuml
+'https://plantuml.com/sequence-diagram
+
+autonumber
+
+"SageMaker Notebook" -> Rubik: start training
+Rubik -> S3: Save checkpoints
+"SageMaker Notebook" -> PartitionService: partition('P3.16xl')
+PartitionService -> S3: save partition files
+PartitionService -> FSx: create FSx
+PartitionService -> DynamoDB: save partition metadata
+PartitionService --> "SageMaker Notebook": partition metadata
+"SageMaker Notebook" -> S3: save .tar.gz with metadata
+"SageMaker Notebook" -> SageMaker: create_model
+@enduml

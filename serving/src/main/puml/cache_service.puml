@@ -1,0 +1,28 @@
+@startuml
+
+package "SageMaker host" as host {
+    folder Rubikon {
+        [rank0] as r0
+        [rank1] as r1
+        [rank2] as r2
+        r0 -[hidden]-> r1
+        r1 -[hidden]-> r2
+    }
+}
+
+package S3Accelerator {
+    [C5.18xl] as c0
+    [C5.18xl] as c1
+
+    c0 -[hidden]-> c1
+}
+
+database S3 {
+}
+
+c0 -> S3
+c1 -> S3
+
+host -right-> S3Accelerator
+
+@enduml
