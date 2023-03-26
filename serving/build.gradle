@@ -29,6 +29,7 @@ dependencies {
         testRuntimeOnly "org.bouncycastle:bcprov-jdk15on:1.70"
     }
     runtimeOnly project(":engines:python")
+    runtimeOnly project(":engines:tritonserver")
 
     testRuntimeOnly "org.yaml:snakeyaml:${snakeyaml_version}"
     testImplementation("org.testng:testng:${testng_version}") {
