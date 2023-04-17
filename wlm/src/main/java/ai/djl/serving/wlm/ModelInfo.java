@@ -73,8 +73,11 @@ public final class ModelInfo<I, O> extends WorkerPoolConfig<I, O> {
     private static final Pattern PATTERN = Pattern.compile("MemAvailable:\\s+(\\d+) kB");
     private static final Pattern SNAKE_CASE = Pattern.compile("[A-Z_]+");
 
-    private String engineName;
-    private String loadOnDevices;
+    private transient String id;
+    private String version;
+    private String modelUrl;
+    String engineName;
+    String loadOnDevices;
 
     // the following fields can be loaded from workflow json file
     private Map<String, String> filters;
@@ -92,6 +95,7 @@ public final class ModelInfo<I, O> extends WorkerPoolConfig<I, O> {
     transient Path downloadDir;
 
     transient Properties prop;
+    private DeviceAware deviceAware;
     private transient Status status;
 
     private transient Class<I> inputClass;
@@ -524,6 +528,9 @@ public final class ModelInfo<I, O> extends WorkerPoolConfig<I, O> {
         }
 
         loadServingProperties();
+        if (deviceAware == null) {
+            deviceAware = DeviceAware.parse(this);
+        }
         downloadS3();
         eventManager.onModelDownloaded(this, downloadDir);
         configPerModelSettings();
@@ -965,76 +972,7 @@ public final class ModelInfo<I, O> extends WorkerPoolConfig<I, O> {
     /** {@inheritDoc} */
     @Override
     public String[] getLoadOnDevices() {
-        Engine eng = Engine.getEngine(engineName);
-        if ("*".equals(loadOnDevices)) {
-            int gpuCount = eng.getGpuCount();
-            String v = Utils.getenv("TENSOR_PARALLEL_DEGREE", "-1");
-            v = prop.getProperty("option.tensor_parallel_degree", v);
-            int tpDegree;
-            if ("max".equals(v)) {
-                if (gpuCount > 0) {
-                    tpDegree = gpuCount;
-                } else {
-                    tpDegree = NeuronUtils.getNeuronCores();
-                }
-            } else {
-                tpDegree = Integer.parseInt(v);
-            }
-            if (gpuCount > 0) {
-                int gpuPerWorker = 1;
-                if (Boolean.parseBoolean(prop.getProperty("option.mpi_mode"))) {
-                    return new String[] {"0"};
-                } else if ("Python".equals(engineName)) {
-                    if (tpDegree > 0) {
-                        gpuPerWorker = tpDegree;
-                        int procs = gpuCount / gpuPerWorker;
-                        if (procs == 0) {
-                            throw new EngineException(
-                                    "GPU devices are not enough to run "
-                                            + gpuPerWorker
-                                            + " partitions.");
-                        }
-                        if (maxWorkers == null || maxWorkers < 0) {
-                            gpuCount = procs;
-                        } else {
-                            gpuCount = Math.min(procs, maxWorkers);
-                        }
-                    }
-                }
-
-                String[] ret = new String[gpuCount];
-                for (int i = 0; i < gpuCount; ++i) {
-                    ret[i] = String.valueOf(i * gpuPerWorker);
-                }
-                return ret;
-            } else if (NeuronUtils.hasNeuron()) {
-                int neurons = NeuronUtils.getNeuronCores();
-                int ncPerWorker;
-                if (tpDegree > 0) {
-                    // Assume user understand TP only works on inf2
-                    ncPerWorker = tpDegree;
-                    int procs = neurons / ncPerWorker;
-                    if (procs == 0) {
-                        throw new EngineException(
-                                "Neuron devices are not enough to run "
-                                        + ncPerWorker
-                                        + " partitions. Please refer to: "
-                                        + "https://github.com/aws-neuron/transformers-neuronx#tensor-parallelism-support");
-                    }
-                    neurons = procs;
-                } else {
-                    ncPerWorker = 1;
-                }
-                String[] ret = new String[neurons];
-                for (int i = 0; i < neurons; ++i) {
-                    ret[i] = "nc" + (i * ncPerWorker);
-                }
-                return ret;
-            }
-        } else if (!loadOnDevices.isEmpty()) {
-            return loadOnDevices.split(";");
-        }
-        return new String[] {"-1"};
+        return deviceAware.allocateDevices();
     }
 
     /** {@inheritDoc} */
@@ -1161,6 +1099,15 @@ public final class ModelInfo<I, O> extends WorkerPoolConfig<I, O> {
             prop.setProperty(
                     "option.speculative_draft_model", draftDownloadDir.toAbsolutePath().toString());
         }
+    }
+
+    int getTensorParallelDegree() {
+        String tpDegree = prop.getProperty("option.tensor_parallel_degree");
+        if (tpDegree == null) {
+            tpDegree = Utils.getenv("TENSOR_PARALLEL_DEGREE", "-1");
+            prop.setProperty("option.tensor_parallel_degree", tpDegree);
+        }
+        return Integer.parseInt(tpDegree);
     }
 
     private static int intValue(Properties prop, String key, int defValue) {

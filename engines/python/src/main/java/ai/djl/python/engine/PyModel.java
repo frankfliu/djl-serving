@@ -305,7 +305,7 @@ public class PyModel extends BaseModel {
         int deviceId = manager.getDevice().getDeviceId();
         for (int i = 0; i < mpiWorkers; ++i) {
             logger.debug("Pre-creating python worker: {} ", i);
-            PyProcess worker = new PyProcess(this, pyEnv, deviceId + i * tp);
+            PyProcess worker = new PyProcess(this, pyEnv, i + deviceId);
             workerQueue.offer(worker);
             if (pool != null) {
                 logger.debug("Submitting to pool: {}", i);
