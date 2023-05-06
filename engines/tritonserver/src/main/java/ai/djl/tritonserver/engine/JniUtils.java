@@ -13,13 +13,9 @@
 package ai.djl.tritonserver.engine;
 
 import ai.djl.engine.EngineException;
-import ai.djl.modality.Input;
-import ai.djl.modality.Output;
 import ai.djl.ndarray.NDArray;
 import ai.djl.ndarray.NDList;
 import ai.djl.ndarray.NDManager;
-import ai.djl.ndarray.types.Shape;
-import ai.djl.translate.TranslateException;
 import ai.djl.util.JsonUtils;
 import ai.djl.util.Utils;
 
@@ -45,12 +41,8 @@ import org.bytedeco.tritonserver.tritonserver.TRITONSERVER_ServerOptions;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 import java.util.Map;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutionException;
 
 /** A class containing utilities to interact with the TritonServer C API. */
 @SuppressWarnings("MissingJavadocMethod")
@@ -58,8 +50,7 @@ public final class JniUtils {
 
     private static final Logger logger = LoggerFactory.getLogger(JniUtils.class);
 
-    private static final Map<Pointer, CompletableFuture<TRITONSERVER_InferenceResponse>> RESPONSES =
-            new ConcurrentHashMap<>();
+    private static final Map<Pointer, StreamResponse> RESPONSES = new ConcurrentHashMap<>();
     private static final ResponseAlloc RESP_ALLOC = new ResponseAlloc();
     private static final ResponseRelease RESP_RELEASE = new ResponseRelease();
     private static final InferRequestComplete REQUEST_COMPLETE = new InferRequestComplete();
@@ -169,27 +160,17 @@ public final class JniUtils {
         return JsonUtils.GSON.fromJson(json, ModelMetadata.class);
     }
 
-    public static Output predict(
-            TRITONSERVER_Server triton, ModelMetadata metadata, NDManager manager, Input input)
-            throws TranslateException {
-        TRITONSERVER_InferenceRequest req = toRequest(triton, metadata, manager, input);
+    public static StreamResponse predict(
+            TRITONSERVER_Server triton, ModelMetadata metadata, NDManager manager, NDList input) {
+        TRITONSERVER_InferenceRequest req = toRequest(triton, metadata, input);
         return predict(triton, metadata, manager, req);
     }
 
-    public static NDList predict(
-            TRITONSERVER_Server triton, ModelMetadata metadata, NDManager manager, NDList input)
-            throws TranslateException {
-        TRITONSERVER_InferenceRequest req = toRequest(triton, metadata, input);
-        Output output = predict(triton, metadata, manager, req);
-        return output.getAsNDList(manager, 0);
-    }
-
-    private static Output predict(
+    private static StreamResponse predict(
             TRITONSERVER_Server triton,
             ModelMetadata metadata,
             NDManager manager,
-            TRITONSERVER_InferenceRequest req)
-            throws TranslateException {
+            TRITONSERVER_InferenceRequest req) {
         // TODO: Can this allocator be re-used?
         TRITONSERVER_ResponseAllocator allocator = new TRITONSERVER_ResponseAllocator(null);
         checkCall(
@@ -201,47 +182,19 @@ public final class JniUtils {
         }
 
         // Perform inference...
-        try {
-            CompletableFuture<TRITONSERVER_InferenceResponse> future = new CompletableFuture<>();
-            RESPONSES.put(req, future);
+        StreamResponse sr = new StreamResponse(metadata, manager, req, allocator);
+        RESPONSES.put(req, sr);
 
-            checkCall(
-                    tritonserver.TRITONSERVER_InferenceRequestSetResponseCallback(
-                            req, allocator, null, RESPONSE_COMPLETE, req));
+        checkCall(
+                tritonserver.TRITONSERVER_InferenceRequestSetResponseCallback(
+                        req, allocator, null, RESPONSE_COMPLETE, req));
 
-            checkCall(tritonserver.TRITONSERVER_ServerInferAsync(triton, req, null));
-
-            // Wait for the inference to complete.
-            TRITONSERVER_InferenceResponse resp = future.get();
-            RESPONSES.remove(req);
-
-            checkCall(tritonserver.TRITONSERVER_InferenceResponseError(resp));
-
-            Output output = toOutput(resp, metadata, manager);
-            checkCall(tritonserver.TRITONSERVER_InferenceResponseDelete(resp));
-
-            return output;
-        } catch (ExecutionException | InterruptedException e) {
-            throw new TranslateException(e);
-        } finally {
-            checkCall(tritonserver.TRITONSERVER_InferenceRequestDelete(req));
-            checkCall(tritonserver.TRITONSERVER_ResponseAllocatorDelete(allocator));
-        }
+        checkCall(tritonserver.TRITONSERVER_ServerInferAsync(triton, req, null));
+        return sr;
     }
 
     private static TRITONSERVER_InferenceRequest toRequest(
-            TRITONSERVER_Server triton, ModelMetadata metadata, NDManager manager, Input input)
-            throws TranslateException {
-        if (input.getProperty("Content-Type", "").startsWith("tensor/")) {
-            throw new TranslateException("Unsupported");
-        }
-        NDList list = input.getAsNDList(manager, 0);
-        return toRequest(triton, metadata, list);
-    }
-
-    private static TRITONSERVER_InferenceRequest toRequest(
-            TRITONSERVER_Server triton, ModelMetadata metadata, NDList list)
-            throws TranslateException {
+            TRITONSERVER_Server triton, ModelMetadata metadata, NDList list) {
         TRITONSERVER_InferenceRequest req = new TRITONSERVER_InferenceRequest(null);
         checkCall(tritonserver.TRITONSERVER_InferenceRequestNew(req, triton, metadata.name, -1));
 
@@ -278,68 +231,6 @@ public final class JniUtils {
         return req;
     }
 
-    private static Output toOutput(
-            TRITONSERVER_InferenceResponse resp, ModelMetadata metadata, NDManager manager)
-            throws TranslateException {
-        int[] outputCount = {0};
-        checkCall(tritonserver.TRITONSERVER_InferenceResponseOutputCount(resp, outputCount));
-        Output output = new Output();
-        output.addProperty("Content-Type", "tensor/ndlist");
-        NDList list = new NDList(outputCount[0]);
-        output.add(list);
-
-        for (int i = 0; i < outputCount[0]; ++i) {
-            BytePointer cname = new BytePointer((Pointer) null);
-            IntPointer datatype = new IntPointer(1);
-            LongPointer shape = new LongPointer((Pointer) null);
-            LongPointer dimCount = new LongPointer(1);
-            Pointer base = new Pointer();
-            SizeTPointer byteSize = new SizeTPointer(1);
-            IntPointer memoryType = new IntPointer(1);
-            LongPointer memoryTypeId = new LongPointer(1);
-            Pointer userPtr = new Pointer();
-
-            checkCall(
-                    tritonserver.TRITONSERVER_InferenceResponseOutput(
-                            resp,
-                            i,
-                            cname,
-                            datatype,
-                            shape,
-                            dimCount,
-                            base,
-                            byteSize,
-                            memoryType,
-                            memoryTypeId,
-                            userPtr));
-
-            if (cname.isNull()) {
-                throw new TranslateException("Unable to get output name.");
-            }
-            String name = cname.getString();
-            DataDescriptor dd = metadata.getOutput(name);
-            if (dd == null) {
-                throw new TranslateException("Unexpected output name: " + name);
-            }
-            int size = Math.toIntExact(dimCount.get());
-            long[] s = new long[size];
-            shape.get(s);
-            TsDataType type = TsDataType.values()[datatype.get()];
-            if (type != dd.datatype) {
-                throw new TranslateException("Unexpected datatype " + type + " for " + name);
-            }
-            int len = Math.toIntExact(byteSize.get());
-            byte[] buf = new byte[len];
-            base.limit(len).asByteBuffer().get(buf);
-            ByteBuffer bb = ByteBuffer.wrap(buf);
-            bb.order(ByteOrder.nativeOrder());
-            NDArray array = manager.create(bb, new Shape(s), type.toDataType());
-            array.setName(dd.name);
-            list.add(array);
-        }
-        return output;
-    }
-
     private static void printServerStatus(TRITONSERVER_Server triton) {
         // Print status of the triton.
         TRITONSERVER_Message metadata = new TRITONSERVER_Message(null);
@@ -352,7 +243,7 @@ public final class JniUtils {
         checkCall(tritonserver.TRITONSERVER_MessageDelete(metadata));
     }
 
-    private static void checkCall(TRITONSERVER_Error err) {
+    static void checkCall(TRITONSERVER_Error err) {
         if (err != null) {
             String error =
                     tritonserver.TRITONSERVER_ErrorCodeString(err)
@@ -379,24 +270,16 @@ public final class JniUtils {
                 PointerPointer bufferUserPtr,
                 IntPointer actualMemoryType,
                 LongPointer actualMemoryTypeId) {
-            // Initially attempt to make the actual memory type and id that we
-            // allocate be the same as preferred memory type
             actualMemoryType.put(0, tritonserver.TRITONSERVER_MEMORY_CPU);
             actualMemoryTypeId.put(0, 0);
 
-            // If 'byte_size' is zero just return 'buffer' == nullptr, we don't
-            // need to do any other book-keeping.
-            logger.debug("allocate {}: {} bytes.", tensorName, byteSize);
+            bufferUserPtr.put(0, null);
             if (byteSize == 0) {
                 buffer.put(0, null);
-                bufferUserPtr.put(0, null);
             } else {
                 Pointer allocatedPtr = Pointer.malloc(byteSize);
-                // Pass the tensor name with bufferUserPtr so we can show it when
-                // releasing the buffer.
                 if (!allocatedPtr.isNull()) {
                     buffer.put(0, allocatedPtr);
-                    bufferUserPtr.put(0, Loader.newGlobalRef(tensorName));
                 } else {
                     throw new EngineException("Out of memory, malloc failed.");
                 }
@@ -417,17 +300,8 @@ public final class JniUtils {
                 long byteSize,
                 int memoryType,
                 long memoryTypeId) {
-            String name;
-            if (bufferUserPtr != null) {
-                name = (String) Loader.accessGlobalRef(bufferUserPtr);
-            } else {
-                name = "<unknown>";
-            }
-
-            logger.info("Releasing buffer size {} for result {}", byteSize, name);
             Pointer.free(buffer);
             Loader.deleteGlobalRef(bufferUserPtr);
-
             return null; // Success
         }
     }
@@ -449,8 +323,10 @@ public final class JniUtils {
         @Override
         public void call(TRITONSERVER_InferenceResponse response, int flags, Pointer userp) {
             if (response != null) {
-                // Send 'response' to the future.
-                RESPONSES.get(userp).complete(response);
+                boolean last = (flags & 1) != 0;
+                StreamResponse sr = RESPONSES.get(userp);
+                checkCall(tritonserver.TRITONSERVER_InferenceResponseError(response));
+                sr.appendContent(response, last);
             }
         }
     }

@@ -17,6 +17,9 @@ import ai.djl.engine.Engine;
 import ai.djl.huggingface.tokenizers.Encoding;
 import ai.djl.huggingface.tokenizers.HuggingFaceTokenizer;
 import ai.djl.inference.Predictor;
+import ai.djl.inference.streaming.ChunkedBytesSupplier;
+import ai.djl.modality.Input;
+import ai.djl.modality.Output;
 import ai.djl.ndarray.NDArray;
 import ai.djl.ndarray.NDList;
 import ai.djl.ndarray.NDManager;
@@ -25,6 +28,7 @@ import ai.djl.ndarray.types.Shape;
 import ai.djl.repository.zoo.Criteria;
 import ai.djl.repository.zoo.ZooModel;
 import ai.djl.translate.NoBatchifyTranslator;
+import ai.djl.translate.ServingTranslator;
 import ai.djl.translate.TranslateException;
 import ai.djl.translate.TranslatorContext;
 
@@ -36,8 +40,11 @@ import org.testng.annotations.Test;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Paths;
 import java.util.Arrays;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 public class TsEngineTest {
 
@@ -48,10 +55,36 @@ public class TsEngineTest {
         logger.info("shutting down");
         TsEngine engine = (TsEngine) Engine.getEngine("TritonServer");
         engine.unload();
+
         Runtime.getRuntime().halt(0);
     }
 
     @Test(enabled = true)
+    public void testServingTritonModel() throws ModelException, IOException, TranslateException {
+        Criteria<Input, Output> criteria =
+                Criteria.builder()
+                        .setTypes(Input.class, Output.class)
+                        .optModelPath(Paths.get("/opt/ml/model/fastertransformer"))
+                        .optTranslator(new FasterTransformerServingTranslator())
+                        .optEngine("TritonServer")
+                        .build();
+
+        try (ZooModel<Input, Output> model = criteria.loadModel();
+                Predictor<Input, Output> predictor = model.newPredictor()) {
+            Input in = new Input();
+            in.add("translate English to German: The house is wonderful.");
+            Output output = predictor.predict(in);
+            ChunkedBytesSupplier cbs = (ChunkedBytesSupplier) output.getData();
+            while (cbs.hasNext()) {
+                byte[] line = cbs.nextChunk(1, TimeUnit.MINUTES);
+                logger.info("========= {}", new String(line, StandardCharsets.UTF_8));
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    @Test(enabled = false)
     public void testTritonModel() throws ModelException, IOException, TranslateException {
         Criteria<String, String> criteria =
                 Criteria.builder()
@@ -96,6 +129,31 @@ public class TsEngineTest {
         }
     }
 
+    private static final class FasterTransformerServingTranslator implements ServingTranslator {
+
+        FasterTransformerTranslator translator;
+
+        public FasterTransformerServingTranslator() {
+            translator = new FasterTransformerTranslator();
+        }
+
+        @Override
+        public void setArguments(Map<String, ?> arguments) {}
+
+        @Override
+        public NDList processInput(TranslatorContext ctx, Input input) {
+            String text = input.getAsString(0);
+            return translator.processInput(ctx, text);
+        }
+
+        @Override
+        public Output processOutput(TranslatorContext ctx, NDList list) throws Exception {
+            Output out = new Output();
+            out.add(translator.processOutput(ctx, list));
+            return out;
+        }
+    }
+
     private static final class FasterTransformerTranslator
             implements NoBatchifyTranslator<String, String> {
 
@@ -115,17 +173,22 @@ public class TsEngineTest {
 
         @Override
         public String processOutput(TranslatorContext ctx, NDList list) throws TranslateException {
+            Integer start = (Integer) ctx.getAttachment("start");
+            if (start == null) {
+                start = 0;
+            }
             NDArray array = list.get("output_ids");
             NDArray sequenceLength = list.get("sequence_length");
-            int outSize = sequenceLength.toIntArray()[0] - 1;
+            int outSize = sequenceLength.toIntArray()[0] - start - 1;
             int[] buf = array.toIntArray();
             if (outSize > buf.length) {
                 throw new TranslateException("Invalid sequence_length: " + outSize);
             }
             long[] ids = new long[outSize];
-            for (int i = 0; i < outSize; ++i) {
+            for (int i = start; i < outSize; ++i) {
                 ids[i] = buf[i];
             }
+            ctx.setAttachment("start", outSize);
             return tokenizer.decode(ids).trim();
         }
 
