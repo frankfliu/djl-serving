@@ -1142,6 +1142,7 @@ public class ModelServerTest {
         String strModelPrefix = "/models/invalid_model";
         String url = strModelPrefix + "/adapters/adaptable/update?src=src1";
         request(channel, HttpMethod.POST, url);
+
         channel.closeFuture().sync();
         channel.close().sync();
         assertHttpCode(HttpResponseStatus.NOT_FOUND.code());
@@ -1885,7 +1886,9 @@ public class ModelServerTest {
         } else {
             fail("Channel closed unexpectedly.");
         }
-        Assert.assertTrue(latch.await(2, TimeUnit.MINUTES));
+        if (!latch.await(2, TimeUnit.MINUTES)) {
+            fail("latch timed out.");
+        }
     }
 
     private void assertHttpOk() {
@@ -1962,20 +1965,30 @@ public class ModelServerTest {
         /** {@inheritDoc} */
         @Override
         public void channelRead0(ChannelHandlerContext ctx, FullHttpResponse msg) {
-            if (mode == 0) {
-                httpStatus = msg.status();
-            } else {
-                httpStatus2 = msg.status();
+            try {
+                if (mode == 0) {
+                    httpStatus = msg.status();
+                } else {
+                    httpStatus2 = msg.status();
+                }
+                result = msg.content().toString(StandardCharsets.UTF_8);
+                headers = msg.headers();
+                countDown();
+            } catch (Exception e) {
+                logger.error("Exception while read request", e);
+                throw e;
             }
-            result = msg.content().toString(StandardCharsets.UTF_8);
-            headers = msg.headers();
-            countDown();
         }
 
         /** {@inheritDoc} */
         @Override
         public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-            logger.error("Unknown exception", cause);
+            if (httpStatus == null) {
+                httpStatus = new HttpResponseStatus(555, "Unexpected connect error");
+                logger.error("Exception before request is read", cause);
+            } else {
+                logger.error("Unknown exception", cause);
+            }
             ctx.close();
             countDown();
         }
